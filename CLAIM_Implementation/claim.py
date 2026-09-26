@@ -50,33 +50,11 @@ def downward_closure(Ws):
     for proj in Ws:
         ans.update(powerset(proj))
     return list(sorted(ans, key=len))
-
-
-def compile_workload(workload):
-    weights = {cl: wt for (cl, wt) in workload}
-    workload_cliques = weights.keys()
-
-    def score(cl):
-        return sum(
-            weights[workload_cl] * len(set(cl) & set(workload_cl))
-            for workload_cl in workload_cliques
-        )
-
-    return {cl: score(cl) for cl in downward_closure(workload_cliques)}
-
-
-def filter_candidates(candidates, model, size_limit):
-    ans = {}
-    free_cliques = downward_closure(model.cliques)
-    for cl in candidates:
-        cond1 = (
-            junction_tree.hypothetical_model_size(model.domain, model.cliques + [cl]) <= size_limit
-        )
-        cond2 = cl in free_cliques
-        if cond1 or cond2:
-            ans[cl] = candidates[cl]
-    return ans
-
+import sys
+import os
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../AIM_Implementation/mechanisms')))
+from aim import powerset, downward_closure, compile_workload, filter_candidates
+from aim import default_params as aim_default_params
 
 class CLAIM(Mechanism):
     """Causally-Learned Adaptive and Iterative Mechanism for DP Synthetic Data.
