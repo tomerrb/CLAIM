@@ -3,9 +3,8 @@
 This implementation supports two selection modes:
 - "marginal" (default): Original L1-based selection using the exponential mechanism.
   Selects the worst-approximated marginal based on L1 distance.
-- "ate": ATE-based selection for causal inference applications.
-  Selects the marginal that most improves Average Treatment Effect estimation.
-  Requires DoWhy library and causal structure specification.
+- "ate": causal selection with FWL scores on complete query marginals,
+  or the separate legacy DoWhy backend.
 
 Note that with the default settings, CLAIM can take many hours to run. You can configure
 the runtime/utility tradeoff via the max_model_size flag. We recommend setting it to 1.0
@@ -27,6 +26,9 @@ from mbi import (
     junction_tree,
     LinearMeasurement,
 )
+import sys
+import os
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../AIM_Implementation/mechanisms')))
 from mechanism import Mechanism
 from collections import defaultdict
 from scipy.optimize import bisect
@@ -50,9 +52,10 @@ def downward_closure(Ws):
     for proj in Ws:
         ans.update(powerset(proj))
     return list(sorted(ans, key=len))
-import sys
-import os
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../AIM_Implementation/mechanisms')))
+
+def _to_frame(ds):
+    """pandas view of an mbi Dataset (the new mbi has no Dataset.df)."""
+    return pd.DataFrame({a: np.asarray(v) for a, v in ds.to_dict().items()})
 from aim import powerset, downward_closure, compile_workload, filter_candidates
 from aim import default_params as aim_default_params
 
@@ -68,6 +71,8 @@ class CLAIM(Mechanism):
         prng: Optional random number generator.
         rounds: Number of selection rounds (default: 16 * domain size).
         max_model_size: Maximum model size in MB (default: 80).
+        max_candidate_arity: Candidate marginal arity ell, at least the size
+            of the largest causal query (default: that query size).
         max_iters: Maximum iterations for mirror descent (default: 1000).
         structural_zeros: Dict of structural zeros constraints.
         selection_mode: "marginal" (L1-based) or "ate" (ATE-based) selection.
@@ -82,6 +87,12 @@ class CLAIM(Mechanism):
         causal_graph_path: Path to GML file with causal graph (required for ATE mode).
         ate_sample_size: Samples for final ATE computation (default: 10000).
         sim_sample_size: Samples for simulation during selection (default: 5000).
+            None = the released record count n_tilde (FWL path).
+        sigma_n: Noise scale for the released record count.
+        reference_ate_rho: Absolute zCDP budget for the reference ATE release.
+        ate_method: "fwl" (selection on all marginals up to the candidate arity,
+            default) or
+            "dowhy" (the legacy causal selection backend).
         marginal_weight: λ in claim_algorithm_fwl.tex. Weight for the
             statistical term L_r in q_r(D) = λ·L_r + (1-λ)·κ·A_r (default: 0.3).
             0.0 = pure causal (κ·A_r) selection, 1.0 = pure statistical (L_r)
@@ -100,13 +111,17 @@ class CLAIM(Mechanism):
         max_model_size=80,
         max_iters=1000,
         structural_zeros={},
-        selection_mode="marginal",
+        ############ CHANGED TO MATCH PSEUDOCODE ############
+        selection_mode=None,
+        #################
         ate_configs=None,
         causal_graph_path=None,
         ate_sample_size=10000,
         sim_sample_size=5000,
         marginal_weight=0.3,
-        ate_method="dowhy",
+        ############ CHANGED TO MATCH PSEUDOCODE ############
+        ate_method="fwl",
+        #################
         mu_eta=1e-6,
         kappa_eta=1e-6,
         adaptive_lambda=True,
@@ -118,14 +133,30 @@ class CLAIM(Mechanism):
         ate_sensitivity=None,
         reference_ate_rho_fraction=0.05,
         ate_outcome_range=(-1.0, 1.0),
+        ############ CHANGED TO MATCH PSEUDOCODE ############
+        overlap_eta=0.01,
+        n_min=1,
+        sigma_n=None,
+        max_candidate_arity=None,
+        reference_ate_rho=None,
+        #################
     ):
-        super(CLAIM, self).__init__(epsilon, delta, prng)
+        ############ CHANGED TO MATCH PSEUDOCODE ############
+        super(CLAIM, self).__init__(
+            epsilon, delta, prng=np.random if prng is None else prng
+        )
+        self._initial_rho = self.rho
+        #################
         self.rounds = rounds
         self.max_iters = max_iters
         self.max_model_size = max_model_size
         self.structural_zeros = structural_zeros
 
         # Selection mode configuration
+        ############ CHANGED TO MATCH PSEUDOCODE ############
+        if selection_mode is None:
+            selection_mode = "ate" if ate_configs else "marginal"
+        #################
         self.selection_mode = selection_mode
         if selection_mode not in ("marginal", "ate"):
             raise ValueError(f"selection_mode must be 'marginal' or 'ate', got '{selection_mode}'")
@@ -141,8 +172,8 @@ class CLAIM(Mechanism):
         self.sim_sample_size = sim_sample_size
         self.causal_graph = None
         self._true_ates = {}  # Dict of {name: true_ate_value}
-        # FWL components cached at the start of run() (ate_method="fwl" only):
-        # v_i = E_D[(T_i - T̄(Z_i))^2] per ATE config and κ = 1 / Σ_i β_i / v_i
+        # In the FWL path these come from the current PGM each round.
+        # The legacy DoWhy path retains its original empirical scaling method.
         self._fwl_v = {}
         self._fwl_kappa = None
 
@@ -157,10 +188,56 @@ class CLAIM(Mechanism):
         self.sigma_ate = 0.0
         self.ate_sensitivity = ate_sensitivity
         self.reference_ate_rho_fraction = float(reference_ate_rho_fraction)
+        ############ CHANGED TO MATCH PSEUDOCODE ############
+        self.reference_ate_rho = (None if reference_ate_rho is None
+                                  else float(reference_ate_rho))
+        if max_candidate_arity is not None and (
+                isinstance(max_candidate_arity, bool)
+                or not isinstance(max_candidate_arity, (int, np.integer))):
+            raise ValueError("max_candidate_arity must be an integer")
+        self.max_candidate_arity = (None if max_candidate_arity is None
+                                    else int(max_candidate_arity))
+        self._fwl_reference_rho = None
+        self.sigma_n = None if sigma_n is None else float(sigma_n)
+        self.overlap_eta = float(overlap_eta)
+        self.n_min = int(n_min)
+        self._fwl_tilde_n = None
+        self._reference_release = {}
+        #################
         self.ate_outcome_range = (float(ate_outcome_range[0]), float(ate_outcome_range[1]))
         self.mu_eta = float(mu_eta)
         self.kappa_eta = float(kappa_eta)
         self.reference_ates = reference_ates
+
+        ############ CHANGED TO MATCH PSEUDOCODE ############
+        if not 0 < self.overlap_eta <= 0.25 or self.n_min < 1:
+            raise ValueError("FWL requires overlap_eta in (0, 1/4] and n_min >= 1")
+        if selection_mode == "ate" and ate_method == "fwl":
+            if self._initial_rho <= 0:
+                raise ValueError("FWL selection requires a positive zCDP budget")
+            if self.marginal_weight <= 0:
+                raise ValueError("FWL selection requires marginal_weight > 0")
+            if reference_ates is not None:
+                raise ValueError("FWL selection releases its own private reference ATEs")
+            if self.sigma_n is None:
+        #################
+                # Default to spending 1% of rho on the noisy count.  A supplied
+                # sigma_n is used directly, as in the pseudocode.
+                ############ CHANGED TO MATCH PSEUDOCODE ############
+                self.sigma_n = np.sqrt(1 / (2 * 0.01 * self._initial_rho))
+            if not np.isfinite(self.sigma_n) or self.sigma_n <= 0:
+                raise ValueError("FWL sigma_n must be finite and positive")
+            self._fwl_reference_rho = (
+                self.reference_ate_rho if self.reference_ate_rho is not None
+                else self.reference_ate_rho_fraction * self._initial_rho
+            )
+            if not np.isfinite(self._fwl_reference_rho) or self._fwl_reference_rho <= 0:
+                raise ValueError("FWL reference release requires a positive budget")
+            if (1 / (2 * self.sigma_n**2)
+                    + self._fwl_reference_rho
+                    >= 0.1 * self._initial_rho):
+                raise ValueError("FWL count and reference releases must leave AIM's 10% selection budget")
+                #################
         
         if not (0.0 <= self.marginal_weight <= 1.0):
             raise ValueError(f"marginal_weight must be in [0, 1], got {self.marginal_weight}")
@@ -168,12 +245,21 @@ class CLAIM(Mechanism):
             raise ValueError("lambda_min/lambda_max must satisfy 0 <= min <= max <= 1")
         if self.adaptive_lambda and self.lambda_min <= 0:
             raise ValueError("adaptive lambda requires lambda_min > 0")
+        ############ CHANGED TO MATCH PSEUDOCODE ############
+        if (selection_mode == "ate" and ate_method == "fwl" and self.adaptive_lambda
+                and not self.lambda_min <= self.marginal_weight <= self.lambda_max):
+            raise ValueError("FWL initial lambda must lie within its adaptive bounds")
+        #################
 
         if selection_mode == "ate":
             if not ate_configs:
                 raise ValueError("ATE mode requires ate_configs (list of ATE configurations)")
             if ate_method == "dowhy" and not causal_graph_path:
                 raise ValueError("ATE mode with ate_method='dowhy' requires causal_graph_path")
+            ############ CHANGED TO MATCH PSEUDOCODE ############
+            if ate_method == "fwl" and len({cfg.get("name") for cfg in ate_configs}) != len(ate_configs):
+                raise ValueError("FWL query names must be unique")
+            #################
 
             # Validate each ATE config
             for i, config in enumerate(ate_configs):
@@ -298,7 +384,8 @@ class CLAIM(Mechanism):
 
         Dispatches on self.ate_method:
           - "dowhy": DoWhy CausalModel with backdoor.linear_regression.
-          - "fwl":   CLAIM-style FWL estimator from fwl.claim_fwl_ate_estimator.
+          - "fwl":   ordinary adjusted ATE for evaluation and AdaptLambda;
+                     selection evaluates the FWL surrogate separately.
 
         Args:
             df: DataFrame containing treatment, outcome, and confounder columns (encoded).
@@ -315,16 +402,21 @@ class CLAIM(Mechanism):
         df_binary = self._binarize_for_ate(df, config)
 
         if self.ate_method == "fwl":
-            from fwl import claim_fwl_ate_estimator
+            ############ CHANGED TO MATCH PSEUDOCODE ############
+            from fwl import claim_adjusted_ate
+            #################
 
             bounds = {k: tuple(v) for k, v in config["bounds"].items()}
-            return claim_fwl_ate_estimator(
+            ############ CHANGED TO MATCH PSEUDOCODE ############
+            return claim_adjusted_ate(
                 df=df_binary,
                 treatment_col=treatment,
                 outcome_col=outcome,
                 adjustment_set=list(config["confounders"]),
                 bounds=bounds,
+                n_min=self.n_min,
             )
+            #################
 
         # Default: DoWhy backdoor adjustment
         from dowhy import CausalModel
@@ -360,27 +452,28 @@ class CLAIM(Mechanism):
         return ates
 
     def _compute_fwl_v_for_config(self, df, config):
-        """Compute v_i = E_D[(T_i - T̄(Z_i))^2] for a single ATE config.
-
-        Uses the same binarization and bounds as the FWL ATE estimator so the
-        v values stay consistent with τ_i^*.
+        """Empirical variance kept only for the pre-existing legacy DoWhy path.
         """
-        from fwl import claim_fwl_v
+        ############ CHANGED TO MATCH PSEUDOCODE ############
+        from fwl import legacy_empirical_variance
+        #################
 
         df_binary = self._binarize_for_ate(df, config)
         bounds = {k: tuple(v) for k, v in config["bounds"].items()}
-        return claim_fwl_v(
+        ############ CHANGED TO MATCH PSEUDOCODE ############
+        return legacy_empirical_variance(
             df=df_binary,
             treatment_col=config["treatment"],
             adjustment_set=list(config["confounders"]),
             bounds=bounds,
         )
+        #################
 
     def _cache_fwl_components(self, df):
-        """Cache v_i for each ATE and the κ scaling factor used in q_r.
+        """Legacy DoWhy-only scaling; FWL obtains these from the PGM.
 
         κ = 1 / Σ_i (β_i / v_i), where β_i is the per-ATE weight (config['alpha']).
-        Called once at the start of run() when ate_method='fwl'.
+        Called once at the start of run() only in the legacy DoWhy path.
         """
         self._fwl_v = {
             config["name"]: self._compute_fwl_v_for_config(df, config)
@@ -413,19 +506,34 @@ class CLAIM(Mechanism):
             weighted_error += beta * error
         return weighted_error
 
+    def _model_sample_size(self):
+        """Rows sampled from the model for its ATE: sim_sample_size, or the
+        released record count n_tilde when sim_sample_size is None, so the
+        sample is as sparse as the data (5000 if no count was released)."""
+        ############ MODEL SAMPLE SIZE = n_tilde ############
+        if self.sim_sample_size is not None:
+            return int(self.sim_sample_size)
+        return int(self._fwl_tilde_n) if self._fwl_tilde_n else 5000
+        #################
+
     def _ate_error_for_model(self, model, seed=42):
         """Compute absolute ATE error for the current PGM model."""
         if not self.ate_configs:
             raise ValueError("ATE configs required for ATE error computation")
         
+        ############ PRIVATE FWL REFERENCE (TWO NOISY SUMS) ############
+        # AdaptLambda compares FWL with FWL: the model's FWL effect on m_s
+        # model-generated tuples, with the same eta floor as the reference.
+        df = self._model_to_dataframe(model, self._model_sample_size(), seed=seed)
         if self.ate_method == "fwl":
-            current_ates = {
-                cfg["name"]: self._ate_from_model(model, cfg)
-                for cfg in self.ate_configs
-            }
+            current_ates = {}
+            for cfg in self.ate_configs:
+                n_sum, v_sum = self._fwl_ratio_sums(df, cfg)
+                current_ates[cfg["name"]] = float(np.clip(
+                    n_sum / max(v_sum, self.overlap_eta * len(df)), -1, 1))
         else:
-            df = self._model_to_dataframe(model, self.sim_sample_size, seed=seed)
             current_ates = self.compute_all_ates(df)
+        #################
             
         error = self.compute_weighted_ate_error(self._true_ates, current_ates)
         return error, current_ates
@@ -451,7 +559,14 @@ class CLAIM(Mechanism):
         for cl in used_cliques:
             y = noisy_by_clique[cl]
             xest = model.project(cl).datavector()
-            total += 0.5 * np.linalg.norm(y - xest, 1) / max(y.sum(), 1e-12)
+            ############ CHANGED TO MATCH PSEUDOCODE ############
+            if self.ate_method == "fwl" and self._fwl_tilde_n:
+                total += 0.5 * np.linalg.norm(
+                    y / self._fwl_tilde_n - xest / xest.sum(), 1
+                )
+            else:
+                total += 0.5 * np.linalg.norm(y - xest, 1) / max(y.sum(), 1e-12)
+            #################
         return total / len(used_cliques)
 
     def _derived_tolerances(self, measurements, cliques):
@@ -461,25 +576,42 @@ class CLAIM(Mechanism):
         exhibit is incoherent -- the schedule would chase pure noise. So each
         tolerance is z times its perfect-model noise floor:
 
-        - theta_A = z * (sigma_ATE + sigma_MC). Even if the model's ATE were
-          exact, the measured error |ref - tau(model)| includes the Gaussian
-          noise of the reference release (std sigma_ATE, public) and the
-          Monte-Carlo error of estimating the model ATE from sim_sample_size
-          synthetic rows, conservatively bounded by
-          sigma_MC = (y_max - y_min) / sqrt(sim_sample_size).
+        - For FWL, theta_A is z times the weighted expected absolute noise
+          in the released reference ATEs, plus 1/sqrt(sim_sample_size).
+          Each query's noise scale is the delta-method sd of the released
+          ratio, sigma * sqrt(1 + tau^2) / max(V_noised, eta * n_tilde),
+          capped at the public bound 1. The legacy route retains its existing
+          tolerance.
         - theta_L = z * mean_r sqrt(2/pi) * sigma_r * n_r / (2 * sum(y_r)),
           the expected TVD between a perfect model and the *noisy* released
           one-way marginals (E|N(0,s)| = s * sqrt(2/pi) per cell), using the
           released noisy total as the public stand-in for N.
 
-        z = TOLERANCE_Z = 2 converts the mean noise level into a
-        pass-with-high-probability threshold (~95% for the Gaussian case).
+        z = TOLERANCE_Z = 2 scales the expected noise level.
         Every ingredient is part of the DP transcript, so deriving the
         tolerances is post-processing.
         """
         lo, hi = self.ate_outcome_range
-        sigma_mc = (hi - lo) / np.sqrt(self.sim_sample_size)
-        theta_a = self.TOLERANCE_Z * (self.sigma_ate + sigma_mc)
+        sigma_mc = (hi - lo) / np.sqrt(self._model_sample_size())
+        ############ CHANGED TO MATCH PSEUDOCODE ############
+        if self.ate_method == "fwl":
+            ############ PRIVATE FWL REFERENCE (TWO NOISY SUMS) ############
+            expected_reference_error = 0.0
+            floor = self.overlap_eta * self._fwl_tilde_n
+            for config in self.ate_configs:
+                _, noised_v, reference = self._reference_release[config["name"]]
+                sd = min(self.sigma_ate * np.sqrt(1 + reference**2)
+                         / max(noised_v, floor), 1.0)
+                expected_reference_error += (
+                    config["alpha"] * np.sqrt(2 / np.pi) * sd
+                )
+            #################
+            theta_a = self.TOLERANCE_Z * (
+                expected_reference_error + 1 / np.sqrt(self._model_sample_size())
+            )
+        else:
+            theta_a = self.TOLERANCE_Z * (self.sigma_ate + sigma_mc)
+        #################
 
         by_clique = {m.clique: m for m in measurements if m.clique in cliques}
         floors = []
@@ -488,7 +620,12 @@ class CLAIM(Mechanism):
                 continue
             m = by_clique[cl]
             y = m.noisy_measurement
-            total = max(float(np.sum(y)), 1e-12)
+            ############ CHANGED TO MATCH PSEUDOCODE ############
+            total = (
+                self._fwl_tilde_n if self.ate_method == "fwl" and self._fwl_tilde_n
+                else max(float(np.sum(y)), 1e-12)
+            )
+            #################
             floors.append(np.sqrt(2 / np.pi) * m.stddev * y.size / (2 * total))
         if not floors:
             raise ValueError("no noisy measurements available to derive tvd_tolerance")
@@ -523,6 +660,10 @@ class CLAIM(Mechanism):
         """Update marginal_weight using both ATE error and TVD error (dual criterion)."""
         if not self.adaptive_lambda or self.selection_mode != "ate":
             return
+        ############ CHANGED TO MATCH PSEUDOCODE ############
+        if self.ate_method == "fwl":
+            measured_cliques = [cl for cl in measured_cliques if len(cl) == 1]
+        #################
 
         ate_tolerance = self.ate_tolerance
         tvd_tolerance = self.tvd_tolerance
@@ -557,10 +698,22 @@ class CLAIM(Mechanism):
         Returns:
             DataFrame: Synthetic data.
         """
-        if seed is not None:
-            np.random.seed(seed)
-        synth = model.synthetic_data(rows=num_samples)
-        return synth.df
+        ############ CHANGED TO MATCH PSEUDOCODE ############
+        if seed is None:
+            synth = model.synthetic_data(rows=num_samples)
+        else:
+        #################
+            # Model sampling is post-processing.  Keep its reproducible seed
+            # separate from the RNG stream used for subsequent DP releases.
+            ############ CHANGED TO MATCH PSEUDOCODE ############
+            private_rng_state = np.random.get_state()
+            try:
+                np.random.seed(seed)
+                synth = model.synthetic_data(rows=num_samples)
+            finally:
+                np.random.set_state(private_rng_state)
+            #################
+        return _to_frame(synth)
 
     def _factor_to_weighted_df(self, factor, weight_col="_w"):
         """Flatten a PGM Factor into a one-row-per-cell DataFrame with a normalized weight column.
@@ -577,7 +730,7 @@ class CLAIM(Mechanism):
         Returns:
             DataFrame with one row per cell, columns = factor attributes + weight_col.
         """
-        attrs = list(factor.domain.attrs)
+        attrs = list(factor.domain.attributes)
         sizes = [factor.domain.size(a) for a in attrs]
         flat = np.asarray(factor.values).ravel()
         total = float(flat.sum())
@@ -601,25 +754,88 @@ class CLAIM(Mechanism):
         """
         from fwl import claim_fwl_ate_from_distribution
 
-        treatment = config["treatment"]
-        outcome = config["outcome"]
-        confounders = list(config["confounders"])
-        cols = (treatment, outcome, *confounders)
-
-        factor = model.project(cols)
-        df_cells = self._factor_to_weighted_df(factor)
-
-        # Preserve the per-cell weight across binarization (which only edits T/Y).
-        df_binary = self._binarize_for_ate(df_cells, config)
-
-        bounds = {k: tuple(v) for k, v in config["bounds"].items()}
+        ############ CHANGED TO MATCH PSEUDOCODE ############
+        weights, df_binary, bounds = self._fwl_model_components(model, config)
         return claim_fwl_ate_from_distribution(
             df=df_binary,
-            treatment_col=treatment,
-            outcome_col=outcome,
-            adjustment_set=confounders,
+            treatment_col=config["treatment"],
+            outcome_col=config["outcome"],
+            adjustment_set=list(config["confounders"]),
             bounds=bounds,
+            weights=weights,
         )
+        #################
+
+    def _fwl_model_components(self, model, config):
+        """Freeze the model treatment probabilities and variance for one round."""
+        ############ CHANGED TO MATCH PSEUDOCODE ############
+        from fwl import model_fwl_weights
+        #################
+
+        ############ CHANGED TO MATCH PSEUDOCODE ############
+        treatment = config["treatment"]
+        cols = (treatment, config["outcome"], *config["confounders"])
+        factor = model.project(cols)
+        cells = self._binarize_for_ate(self._factor_to_weighted_df(factor), config)
+        bounds = {name: tuple(pair) for name, pair in config["bounds"].items()}
+        weights = model_fwl_weights(
+            cells, treatment, list(config["confounders"]), bounds,
+            overlap_eta=self.overlap_eta,
+        )
+        return weights, cells, bounds
+        #################
+
+    def _fwl_candidate_pool(self, domain):
+        """All one-way and two-way marginals, every (T, Y, z) marginal for each
+        query and confounder z, and each query's full (T, Y, Z) marginal.
+
+        A full query marginal is included only if its own table fits
+        max_model_size, since a larger one can never pass the model-size
+        filter. max_candidate_arity is not used by this pool.
+        """
+        ############ CHANGED TO MATCH PSEUDOCODE ############
+        attributes = tuple(domain.attributes)
+        for cfg in self.ate_configs:
+            query = (cfg["treatment"], cfg["outcome"], *cfg["confounders"])
+            if len(set(query)) != len(query):
+                raise ValueError(f"ATE query {cfg['name']} has repeated attributes")
+            if any(name not in attributes for name in query):
+                raise ValueError(f"ATE query {cfg['name']} names an unknown attribute")
+        #################
+        ############ SUB-TUPLE CAUSAL CREDIT ############
+        order = {name: i for i, name in enumerate(attributes)}
+        pool = [(name,) for name in attributes]
+        pool += list(itertools.combinations(attributes, 2))
+        for cfg in self.ate_configs:
+            t, y = cfg["treatment"], cfg["outcome"]
+            for z in cfg["confounders"]:
+                pool.append(tuple(sorted((t, y, z), key=order.get)))
+            full = tuple(sorted((t, y, *cfg["confounders"]), key=order.get))
+            if junction_tree.hypothetical_model_size(domain, [full]) <= self.max_model_size:
+                pool.append(full)
+        return {cl: 1.0 for cl in dict.fromkeys(pool)}
+        #################
+
+    def _fwl_queries_for_candidate(self, clique):
+        """Queries that the candidate scores: it contains the query's treatment,
+        outcome and at least one of its confounders."""
+        ############ SUB-TUPLE CAUSAL CREDIT ############
+        attributes = set(clique)
+        return [cfg for cfg in self.ate_configs
+                if cfg["treatment"] in attributes and cfg["outcome"] in attributes
+                and attributes.intersection(cfg["confounders"])]
+        #################
+
+    def _fwl_subquery(self, config, clique):
+        """The query restricted to the confounders the candidate contains, and
+        its key. Every FWL quantity of the candidate is computed as if this
+        were the query; the reference ATE stays the full query's."""
+        ############ SUB-TUPLE CAUSAL CREDIT ############
+        attributes = set(clique)
+        sub = dict(config, confounders=[z for z in config["confounders"]
+                                        if z in attributes])
+        return sub, (config["name"], tuple(sub["confounders"]))
+        #################
 
     def _simulate_measurement(self, model, data, clique, measurements):
         """Simulate measuring a clique without actually adding noise.
@@ -651,13 +867,15 @@ class CLAIM(Mechanism):
         potentials = model.potentials.expand(pcliques)
         
         # Fit with fewer iterations for speed during simulation
-        sim_model = estimation.mirror_descent(
+        ############ CHANGED TO MATCH PSEUDOCODE ############
+        sim_model = estimation.MirrorDescent().estimate(
             data.domain, 
             sim_measurements, 
             iters=min(self.max_iters, 500),
-            potentials=potentials,
+            warm_start=potentials,
             callback_fn=lambda *_: None
         )
+        #################
         
         return sim_model
 
@@ -711,7 +929,9 @@ class CLAIM(Mechanism):
             x = answers[cl]
             xest = model.project(cl).datavector()
             n_r = model.domain.size(cl)
-            N = x.sum()
+            ############ CHANGED TO MATCH PSEUDOCODE ############
+            N = self._fwl_tilde_n if self.ate_method == "fwl" else x.sum()
+            #################
             bias = np.sqrt(2 / np.pi) * sigma * n_r / N
             # Normalize count vectors to probability distributions
             x_prob = x / N
@@ -779,6 +999,171 @@ class CLAIM(Mechanism):
 
         return mu_t
 
+    def _fwl_dynamic_mu(self, candidates, model, prev_model, sigma, kappa,
+                        ############ CHANGED TO MATCH PSEUDOCODE ############
+                        covered, current_components):
+                        #################
+        """Median score proxies using consecutive released PGM models.
+
+        Substitute the current model for D and the previous model for the
+        current model, including its frozen FWL coefficients.  No raw data or
+        current-round selection result enters this calibration.
+        """
+        ############ CHANGED TO MATCH PSEUDOCODE ############
+        from fwl import claim_fwl_ate_from_distribution
+        #################
+
+        ############ CHANGED TO MATCH PSEUDOCODE ############
+        if prev_model is None:
+            return 1.0
+        eligible = [cl for cl in candidates if covered[cl]]
+        if not eligible:
+            return 1.0
+        #################
+        ############ SUB-TUPLE CAUSAL CREDIT ############
+        # One proxy pair per (query, confounders in the candidate), computed
+        # as if the candidate's sub-query were the query.
+        proxy_values = {}
+        for cl in eligible:
+            for cfg in covered[cl]:
+                sub, key = self._fwl_subquery(cfg, cl)
+                if key in proxy_values:
+                    continue
+                weights, prev_cells, bounds = self._fwl_model_components(prev_model, sub)
+                current_cells = current_components[key][1]
+                args = (sub["treatment"], sub["outcome"],
+                        list(sub["confounders"]), bounds)
+                proxy_values[key] = (
+                    claim_fwl_ate_from_distribution(
+                        prev_cells, *args, weights=weights
+                    ),
+                    claim_fwl_ate_from_distribution(
+                        current_cells, *args, weights=weights
+                    ),
+                )
+        #################
+        ############ CHANGED TO MATCH PSEUDOCODE ############
+        l_values, a_values = [], []
+        for cl in eligible:
+            curr = model.project(cl).datavector()
+            prev = prev_model.project(cl).datavector()
+            discrepancy = np.linalg.norm(curr / curr.sum() - prev / prev.sum(), 1)
+            bias = np.sqrt(2 / np.pi) * sigma * model.domain.size(cl) / self._fwl_tilde_n
+            l_values.append(abs(discrepancy - bias))
+        #################
+
+            ############ CHANGED TO MATCH PSEUDOCODE ############
+            causal = 0.0
+            for cfg in covered[cl]:
+                name = cfg["name"]
+                old_value, new_value = proxy_values[self._fwl_subquery(cfg, cl)[1]]
+                reference = self._true_ates[name]
+                causal += cfg["alpha"] * (
+                    abs(reference - old_value) - abs(reference - new_value)
+                )
+            a_values.append(abs(causal))
+        median_l, median_a = np.median(l_values), np.median(a_values)
+        return 1.0 if median_l == 0 or median_a == 0 else float(median_l / (kappa * median_a))
+            #################
+
+    def _select_fwl(self, candidates, answers, data, model, prev_model,
+                          ############ CHANGED TO MATCH PSEUDOCODE ############
+                          epsilon, sigma):
+                          #################
+        """Select with FWL estimates computed on each candidate's own marginal.
+
+        A candidate containing a query's treatment, outcome and some of its
+        confounders is scored as if the query were adjusted for those
+        confounders only; the reference ATE is the full query's.
+        """
+        ############ CHANGED TO MATCH PSEUDOCODE ############
+        from fwl import claim_fwl_ate_estimator, claim_fwl_ate_from_distribution
+        #################
+
+        ############ CHANGED TO MATCH PSEUDOCODE ############
+        if not candidates:
+            raise ValueError("No marginal candidates satisfy the model-size bound")
+        statistical = self._compute_stat_term(candidates, answers, model, sigma)
+        covered = {cl: self._fwl_queries_for_candidate(cl) for cl in candidates}
+        if not any(covered.values()):
+            self._fwl_v = {}
+            self._fwl_kappa = None
+            print("FWL components: no eligible marginal covers a causal query")
+            return self.exponential_mechanism(statistical, epsilon, 1 / self._fwl_tilde_n)
+        #################
+
+        ############ SUB-TUPLE CAUSAL CREDIT ############
+        # For each (query, confounders in the candidate): the model's estimate
+        # and our estimator on the data, both over the candidate's marginal,
+        # with coefficients and v read off the current model's marginal.
+        per_candidate = {cl: 0.0 for cl in candidates}
+        variances, current_components, values = {}, {}, {}
+        frame = None
+        for cl in candidates:
+            for cfg in covered[cl]:
+                sub, key = self._fwl_subquery(cfg, cl)
+                if key not in values:
+                    weights, cells, bounds = self._fwl_model_components(model, sub)
+                    current_components[key] = (weights, cells, bounds)
+                    variances[key] = weights.variance
+                    args = (sub["treatment"], sub["outcome"],
+                            list(sub["confounders"]), bounds)
+                    model_value = claim_fwl_ate_from_distribution(
+                        cells, *args, weights=weights
+                    )
+                    if frame is None:
+                        frame = _to_frame(data)
+                    cols = [sub["treatment"], sub["outcome"], *sub["confounders"]]
+                    real_rows = self._binarize_for_ate(frame[cols], sub)
+                    data_value = claim_fwl_ate_estimator(
+                        real_rows, *args, weights=weights,
+                        n_tilde=self._fwl_tilde_n,
+                    )
+                    values[key] = (model_value, data_value)
+                model_value, data_value = values[key]
+                reference = self._true_ates[cfg["name"]]
+                per_candidate[cl] += cfg["alpha"] * (
+                    abs(reference - model_value) - abs(reference - data_value)
+                )
+
+        # κ bounds every candidate's causal sensitivity, sum_i β_i/(ñ v_{i,r}), by 1/ñ.
+        denom = max(sum(cfg["alpha"] / variances[self._fwl_subquery(cfg, cl)[1]]
+                        for cfg in covered[cl]) for cl in candidates)
+        if denom <= 0:
+            return self.exponential_mechanism(statistical, epsilon, 1 / self._fwl_tilde_n)
+        kappa = 1 / denom
+        self._fwl_v = variances
+        self._fwl_kappa = kappa
+        print("FWL components (current model, scored sub-queries):")
+        for config in self.ate_configs:
+            name = config["name"]
+            vs = [v for (query, _), v in variances.items() if query == name]
+            if vs:
+                print(f"  v[{name}]: {len(vs)} sub-queries, "
+                      f"min {min(vs):.6f}, max {max(vs):.6f}")
+        print(f"  κ = {self._fwl_kappa:.6f}")
+        #################
+        ############ CHANGED TO MATCH PSEUDOCODE ############
+        mu = self._fwl_dynamic_mu(
+            candidates, model, prev_model, sigma, kappa, covered,
+            current_components,
+        )
+        lam = self.marginal_weight
+        if not 0 < lam <= 1:
+            raise ValueError("FWL selection requires a positive lambda")
+        normalizer = lam + (1 - lam) * mu
+        qualities = {
+            cl: (lam * statistical[cl]
+                 + (1 - lam) * mu * kappa * per_candidate[cl]) / normalizer
+            for cl in candidates
+        }
+        #################
+
+        # Each sub-query contribution has sensitivity at most β_i/(n_tilde v_{i,r}).
+        ############ CHANGED TO MATCH PSEUDOCODE ############
+        return self.exponential_mechanism(qualities, epsilon, 1 / self._fwl_tilde_n)
+        #################
+
     def worst_ate_approximated(
         self, candidates, answers, data, model, prev_model, measurements,
         epsilon, sigma
@@ -804,6 +1189,12 @@ class CLAIM(Mechanism):
         Returns:
             tuple: Selected clique.
         """
+        ############ CHANGED TO MATCH PSEUDOCODE ############
+        if self.ate_method == "fwl":
+            return self._select_fwl(
+                candidates, answers, data, model, prev_model, epsilon, sigma
+            )
+        #################
         # Use cached true ATEs
         true_ates = self._true_ates
         
@@ -965,8 +1356,89 @@ class CLAIM(Mechanism):
         )  # if all weights are 0, could be a problem
         return self.exponential_mechanism(errors, eps, max_sensitivity)
 
+    def _release_fwl_count(self, data):
+        """Release the noisy dataset size before selection."""
+        ############ CHANGED TO MATCH PSEUDOCODE ############
+        rho_count = 1 / (2 * self.sigma_n**2)
+        self._fwl_tilde_n = max(int(np.rint(data.records + self.gaussian_noise(self.sigma_n, 1)[0])), 1)
+        self.rho -= rho_count
+        #################
+
+    ############ CHANGED TO MATCH PSEUDOCODE ############
+    @staticmethod
+    #################
+    def _fwl_final_budget_guard(rho_used, total_rho, alpha, selection_rho, sigma):
+        """Cap the next selection and measurement to the remaining budget."""
+        ############ CHANGED TO MATCH PSEUDOCODE ############
+        remaining = total_rho - rho_used
+        if remaining <= 0:
+            raise ValueError("No budget remains for a CLAIM selection round")
+        if remaining <= 2 * (selection_rho + 1 / (2 * sigma**2)):
+            return (1 - alpha) * remaining, np.sqrt(1 / (2 * alpha * remaining))
+        return selection_rho, sigma
+        #################
+
+    def _fwl_ratio_sums(self, df, config):
+        """N and V of the FWL effect tau = N / V of the rows in df:
+        N = sum_z (n0 s1 - n1 s0) / n_z and V = sum_z n0 n1 / n_z over the
+        occupied confounder groups z (an empty group contributes zero)."""
+        ############ PRIVATE FWL REFERENCE (TWO NOISY SUMS) ############
+        from fwl import _scaled_columns
+
+        treatment, outcome = config["treatment"], config["outcome"]
+        confounders = list(config["confounders"])
+        bounds = {key: tuple(value) for key, value in config["bounds"].items()}
+        rows = self._binarize_for_ate(df[[treatment, outcome, *confounders]], config)
+        scaled = _scaled_columns(rows, [treatment, outcome], bounds, treatment)
+        group = (rows.groupby(confounders, sort=False).ngroup().to_numpy()
+                 if confounders else np.zeros(len(rows), dtype=int))
+        groups = (pd.DataFrame({"g": group,
+                                "t": scaled[treatment].to_numpy().astype(int),
+                                "y": scaled[outcome].to_numpy()})
+                  .groupby(["g", "t"])["y"].agg(["size", "sum"])
+                  .unstack("t", fill_value=0)
+                  .reindex(columns=pd.MultiIndex.from_product([["size", "sum"], [0, 1]]),
+                           fill_value=0))
+        n0, n1 = groups[("size", 0)].to_numpy(float), groups[("size", 1)].to_numpy(float)
+        s0, s1 = groups[("sum", 0)].to_numpy(float), groups[("sum", 1)].to_numpy(float)
+        n = n0 + n1
+        return float(np.sum((n0 * s1 - n1 * s0) / n)), float(np.sum(n0 * n1 / n))
+        #################
+
+    def _release_fwl_reference_ates(self, data):
+        """Release each query's FWL effect as two noisy sums, (N, V) + noise.
+
+        One row changes N and V by less than 1 each (add/remove neighbours,
+        outcomes in [0, 1]), so the 2k released numbers have L2 sensitivity
+        sqrt(2k) and sigma = sqrt(k / rho_ATE). Only the noisy pair and the
+        reference are kept; the observed groups are never released. The
+        denominator is floored at eta * n_tilde, matching the model-side
+        variance floor; dividing, flooring and clipping are post-processing.
+        """
+        ############ PRIVATE FWL REFERENCE (TWO NOISY SUMS) ############
+        rho_ref = self._fwl_reference_rho
+        sigma_ate = np.sqrt(len(self.ate_configs) / rho_ref)
+        self.sigma_ate = float(sigma_ate)
+        frame = _to_frame(data)
+        floor = self.overlap_eta * self._fwl_tilde_n
+        private_ates = {}
+        for cfg in self.ate_configs:
+            n_sum, v_sum = self._fwl_ratio_sums(frame, cfg)
+            noise = self.gaussian_noise(sigma_ate, 2)
+            noised_n, noised_v = n_sum + noise[0], v_sum + noise[1]
+            reference = float(np.clip(noised_n / max(noised_v, floor), -1, 1))
+            self._reference_release[cfg["name"]] = (noised_n, noised_v, reference)
+            private_ates[cfg["name"]] = reference
+        self.rho -= rho_ref
+        return private_ates
+        #################
+
     def _release_private_reference_ates(self, data):
         """Auto-release a privately DP-noised ATE for each config from a slice of rho."""
+        ############ CHANGED TO MATCH PSEUDOCODE ############
+        if self.ate_method == "fwl":
+            return self._release_fwl_reference_ates(data)
+        #################
         sensitivity = self.ate_sensitivity
         if sensitivity is None:
             lo, hi = self.ate_outcome_range
@@ -982,7 +1454,7 @@ class CLAIM(Mechanism):
         # Store for derived tolerances
         self.sigma_ate = float(sigma_ate)
         
-        raw_ates = self.compute_all_ates(data.df)
+        raw_ates = self.compute_all_ates(_to_frame(data))
         private_ates = {}
         for config in self.ate_configs:
             name = config["name"]
@@ -999,8 +1471,132 @@ class CLAIM(Mechanism):
         print(f"Total rho spent on reference ATEs: {ate_rho_total:.6g}, remaining rho: {self.rho:.6g}")
         return private_ates
 
+    def _run_fwl(self, data, workload, num_synth_rows=None,
+                       ############ CHANGED TO MATCH PSEUDOCODE ############
+                       initial_cliques=None):
+                       #################
+        """Run the FWL loop on all marginals of arity at most ell."""
+        ############ CHANGED TO MATCH PSEUDOCODE ############
+        alpha = 0.9
+        total_rho = self._initial_rho
+        attributes = tuple(data.domain.attributes)
+        rounds = self.rounds or 16 * len(attributes)
+        if rounds < len(attributes):
+            raise ValueError("FWL rounds must include the initial one-way measurements")
+        candidates = self._fwl_candidate_pool(data.domain)
+        oneway = [cl for cl in candidates if len(cl) == 1]
+        if initial_cliques is not None and set(initial_cliques) != set(oneway):
+            raise ValueError("FWL initialization measures every one-way marginal")
+        sigma_0 = np.sqrt(rounds / (2 * alpha * total_rho))
+        #################
+
+        # Release the noisy size, measure all one-way marginals,
+        # fits the initial PGM, then releases the reference ATE statistics.
+        ############ CHANGED TO MATCH PSEUDOCODE ############
+        rho_used = 0.0
+        self._release_fwl_count(data)
+        rho_used += 1 / (2 * self.sigma_n**2)
+        measurements = []
+        for cl in oneway:
+            x = data.project(cl).datavector()
+            measurements.append(LinearMeasurement(
+                x + self.gaussian_noise(sigma_0, x.size), cl, stddev=sigma_0
+            ))
+            rho_used += 1 / (2 * sigma_0**2)
+        model = estimation.MirrorDescent().estimate(
+            data.domain, measurements, iters=self.max_iters,
+            callback_fn=lambda *_: None,
+        )
+        self._true_ates = self._release_fwl_reference_ates(data)
+        rho_used += self._fwl_reference_rho
+        if rho_used >= total_rho:
+            raise ValueError("FWL initialization exhausted the zCDP budget")
+        #################
+
+        # Raw candidate marginals remain local;
+        # the exponential mechanism is the only way their scores are released.
+        ############ CHANGED TO MATCH PSEUDOCODE ############
+        answers = {cl: data.project(cl).datavector() for cl in candidates}
+        previous_model = None
+        t = len(oneway)
+        sigma = sigma_0
+        selection_rho = (1 - alpha) * total_rho / rounds
+        while total_rho - rho_used > 1e-12 * total_rho:
+        #################
+            if t == len(oneway):
+                selection_rho, sigma = self._fwl_final_budget_guard(
+                    rho_used, total_rho, alpha, selection_rho, sigma,
+                )
+            else:
+                after = model.project(cl).datavector()
+                if np.linalg.norm(after - before, 1) <= np.sqrt(2 / np.pi) * sigma * x.size:
+                    selection_rho, sigma = 4 * selection_rho, sigma / 2
+                selection_rho, sigma = self._fwl_final_budget_guard(
+                    rho_used, total_rho, alpha, selection_rho, sigma,
+                )
+            t += 1
+            ############ CHANGED TO MATCH PSEUDOCODE ############
+            rho_used += selection_rho + 1 / (2 * sigma**2)
+            size_limit = self.max_model_size * rho_used / total_rho
+            allowed = {
+                cl: weight for cl, weight in candidates.items()
+                if junction_tree.hypothetical_model_size(
+                    data.domain, list(model.cliques) + [cl]
+                ) <= size_limit
+            }
+            #################
+            ############ CHANGED TO MATCH PSEUDOCODE ############
+            print(
+                f"Maximum candidate marginal size: {max(map(len, allowed))}-way"
+                if allowed else "Maximum candidate marginal size: none"
+            )
+            #################
+
+            # Mechanism.exponential_mechanism uses eps*q/(2*sensitivity).
+            # With eps=sqrt(8*rho_t) and sensitivity=1/n_tilde, this is
+            # sqrt(2*rho_t)*n_tilde*q as in the pseudocode.
+            ############ CHANGED TO MATCH PSEUDOCODE ############
+            epsilon = np.sqrt(8 * selection_rho)
+            cl = self._select_fwl(
+                allowed, answers, data, model, previous_model,
+                epsilon, sigma,
+            )
+            x = answers[cl]
+            measurements.append(LinearMeasurement(
+                x + self.gaussian_noise(sigma, x.size), cl, stddev=sigma
+            ))
+            before = model.project(cl).datavector()
+            pcliques = list(set(m.clique for m in measurements))
+            potentials = model.potentials.expand(pcliques)
+            previous_model = model
+            model = estimation.MirrorDescent().estimate(
+                data.domain, measurements, iters=self.max_iters,
+                warm_start=potentials, callback_fn=lambda *_: None,
+            )
+            self._maybe_update_marginal_weight(
+                model, measurements[:len(oneway)], oneway
+            )
+            #################
+            ############ CLEAR COMPILED CODE ONCE PER ROUND ############
+            # Each round compiles a projection per candidate; without clearing,
+            # the process runs out of memory mappings (vm.max_map_count).
+            jax.clear_caches()
+            #################
+
+        ############ CHANGED TO MATCH PSEUDOCODE ############
+        synth = model.synthetic_data(rows=self._fwl_tilde_n)
+        return model, synth
+        #################
+
     def run(self, data, workload, num_synth_rows=None, initial_cliques=None):
-        # Cache reference ATEs at the start if using ATE mode.
+        ############ CHANGED TO MATCH PSEUDOCODE ############
+        if self.selection_mode == "ate" and self.ate_method == "fwl":
+            return self._run_fwl(
+                data, workload, num_synth_rows=num_synth_rows,
+                initial_cliques=initial_cliques,
+            )
+        #################
+        # Legacy marginal / DoWhy paths keep their existing AIM workload.
         if self.selection_mode == "ate":
             if self.reference_ates is None:
                 self._true_ates = self._release_private_reference_ates(data)
@@ -1013,18 +1609,16 @@ class CLAIM(Mechanism):
                 alpha = config["alpha"]
                 print(f"  {name} (α={alpha}): {self._true_ates[name]:.6f}")
 
-            # κ is needed by worst_ate_approximated regardless of ate_method,
-            # because _ate_from_model always uses FWL regression from the model.
-            # TODO(DP): v_i and κ are derived from raw D and currently used
-            # without DP accounting. See claim_algorithm_fwl.tex for the κ
-            # role in q_r(D); a public-bound or noised substitute is needed
-            # before the FWL path is fully DP.
-            self._cache_fwl_components(data.df)
-            if self.ate_method == "fwl":
-                print("FWL components:")
-                for config in self.ate_configs:
-                    name = config["name"]
-                    print(f"  v[{name}] = {self._fwl_v[name]:.6f}")
+            # The legacy DoWhy coefficient uses raw D and has no separate
+            # privacy accounting. The FWL route above uses the current PGM.
+            self._cache_fwl_components(_to_frame(data))
+            ############ CHANGED TO MATCH PSEUDOCODE ############
+            # if self.ate_method == "fwl":
+            #     print("FWL components:")
+            #     for config in self.ate_configs:
+            #         name = config["name"]
+            #         print(f"  v[{name}] = {self._fwl_v[name]:.6f}")
+            #################
             print(f"  κ = {self._fwl_kappa:.6f}")
 
         rounds = self.rounds or 16 * len(data.domain)
@@ -1051,9 +1645,11 @@ class CLAIM(Mechanism):
 
         zeros = self.structural_zeros
         # NOTE: Haven't incorproated structural zeros back yet after refactoring
-        model = estimation.mirror_descent(
+        ############ CHANGED TO MATCH PSEUDOCODE ############
+        model = estimation.MirrorDescent().estimate(
                 data.domain, measurements, iters=self.max_iters, callback_fn=lambda *_: None
         )
+        #################
 
         t = 0
         terminate = False
@@ -1095,9 +1691,11 @@ class CLAIM(Mechanism):
             pcliques = list(set(M.clique for M in measurements))
             potentials = model.potentials.expand(pcliques)
             prev_model = model  # store p̂_{t-1} as p̂_{t-2} for next iteration
-            model = estimation.mirror_descent(
-                    data.domain, measurements, iters=self.max_iters, potentials=potentials, callback_fn=lambda *_: None
+            ############ CHANGED TO MATCH PSEUDOCODE ############
+            model = estimation.MirrorDescent().estimate(
+                    data.domain, measurements, iters=self.max_iters, warm_start=potentials, callback_fn=lambda *_: None
             )
+            #################
             
             # Optional adaptive lambda update (dual criterion: ATE + TVD).
             measured_cliques = list(dict.fromkeys(M.clique for M in measurements))
@@ -1111,9 +1709,11 @@ class CLAIM(Mechanism):
                 epsilon *= 2
 
         print("Generating Data...")
-        model = estimation.mirror_descent(
-            data.domain, measurements, iters=self.max_iters, potentials=potentials
+        ############ CHANGED TO MATCH PSEUDOCODE ############
+        model = estimation.MirrorDescent().estimate(
+            data.domain, measurements, iters=self.max_iters, warm_start=potentials
         )
+        #################
         synth = model.synthetic_data(rows=num_synth_rows)
 
         return model, synth
@@ -1134,6 +1734,9 @@ def pilot_select_lambda(
     pilot_fraction=0.15,
     pilot_samples=5,
     num_synth_rows=None,
+    ############ CHANGED TO MATCH PSEUDOCODE ############
+    return_mechanism=False,
+    #################
     **claim_kwargs,
 ):
     """Select lambda with cheap pilot CLAIM runs, then run the final CLAIM."""
@@ -1169,11 +1772,11 @@ def pilot_select_lambda(
         # Pre-compute true ATEs
         true_ates = mech._true_ates
         if not true_ates:
-            true_ates = mech.compute_all_ates(data.df)
+            true_ates = mech.compute_all_ates(_to_frame(data))
 
         for b in range(pilot_samples):
             rows = num_synth_rows or data.records
-            pilot_df = model.synthetic_data(rows=rows).df
+            pilot_df = _to_frame(model.synthetic_data(rows=rows))
             pilot_ates = mech.compute_all_ates(pilot_df)
             pilot_error = mech.compute_weighted_ate_error(true_ates, pilot_ates)
             errors.append(pilot_error)
@@ -1197,6 +1800,10 @@ def pilot_select_lambda(
     final_model, final_synth = final_mech.run(
         data, workload, num_synth_rows=num_synth_rows
     )
+    ############ CHANGED TO MATCH PSEUDOCODE ############
+    if return_mechanism:
+        return selected_lambda, scores, final_model, final_synth, final_mech
+    #################
     return selected_lambda, scores, final_model, final_synth
 
 
@@ -1217,8 +1824,13 @@ def default_params():
     params["degree"] = 2
     params["num_marginals"] = None
     params["max_cells"] = 10000
+    ############ CHANGED TO MATCH PSEUDOCODE ############
+    params["max_candidate_arity"] = None
+    #################
     # Selection mode: "marginal" (L1-based) or "ate" (ATE-based)
-    params["selection_mode"] = "marginal"
+    ############ CHANGED TO MATCH PSEUDOCODE ############
+    params["selection_mode"] = None  # ATE when queries are supplied, otherwise marginal
+    #################
     params["mu_eta"] = 1e-6
     params["kappa_eta"] = 1e-6
     params["adaptive_lambda"] = True
@@ -1229,6 +1841,13 @@ def default_params():
     params["reference_ates"] = None
     params["ate_sensitivity"] = None
     params["reference_ate_rho_fraction"] = 0.05
+    ############ CHANGED TO MATCH PSEUDOCODE ############
+    params["reference_ate_rho"] = None
+    params["sigma_n"] = None  # FWL default spends 1% of rho on the count
+    params["overlap_eta"] = 0.01
+    params["n_min"] = 1
+    params["sim_sample_size"] = 5000
+    #################
     params["ate_outcome_min"] = -1.0
     params["ate_outcome_max"] = 1.0
     params["fixed_lambda_from_list"] = False
@@ -1240,8 +1859,10 @@ def default_params():
     params["causal_graph"] = None
     # Hybrid selection weight: 0.0 = pure ATE, 1.0 = pure marginal
     params["marginal_weight"] = 0.3
-    # ATE estimation backend: "dowhy" or "fwl"
-    params["ate_method"] = "dowhy"
+    # Causal selection defaults to the full-query FWL path.
+    ############ CHANGED TO MATCH PSEUDOCODE ############
+    params["ate_method"] = "fwl"
+    #################
 
     return params
 
@@ -1269,15 +1890,23 @@ if __name__ == "__main__":
         type=int,
         help="maximum number of cells for marginals in workload",
     )
+    ############ CHANGED TO MATCH PSEUDOCODE ############
+    parser.add_argument(
+        "--max_candidate_arity", type=int,
+        help="maximum FWL candidate arity ell; default is the largest query size",
+    )
+    #################
     parser.add_argument("--save", type=str, help="path to save synthetic data")
     
     # Selection mode arguments
+    ############ CHANGED TO MATCH PSEUDOCODE ############
     parser.add_argument(
         "--selection_mode",
         type=str,
         choices=["marginal", "ate"],
-        help="Selection mode: 'marginal' (L1-based) or 'ate' (ATE-based)"
+        help="Selection mode: 'ate' when queries are supplied, otherwise 'marginal'"
     )
+    #################
     
     import argparse
     parser.add_argument(
@@ -1321,11 +1950,27 @@ if __name__ == "__main__":
         type=float,
         help="Fraction of total zCDP budget spent auto-releasing a private reference ATE"
     )
+    ############ CHANGED TO MATCH PSEUDOCODE ############
+    parser.add_argument(
+        "--reference_ate_rho", type=float,
+        help="Absolute zCDP budget for the FWL reference release",
+    )
+    parser.add_argument(
+        "--sigma_n", type=float,
+        help="Standard deviation for the FWL noisy record count"
+    )
+    parser.add_argument("--overlap_eta", type=float,
+                        help="Floor for model treatment variance")
+    parser.add_argument("--n_min", type=int,
+                        help="Floor for reference ATE stratum counts")
+    parser.add_argument("--sim_sample_size", type=int,
+                        help="Number of model samples for adaptive lambda")
     parser.add_argument(
         "--ate_outcome_min",
         type=float,
         help="Minimum value the outcome column is clipped to before ATE computation"
     )
+    #################
     parser.add_argument(
         "--ate_outcome_max",
         type=float,
@@ -1359,24 +2004,28 @@ if __name__ == "__main__":
         help="Path to JSON file with ATE configurations. Each config should have: "
              "name, treatment, outcome, confounders (list), alpha (weight in [0,1])"
     )
+    ############ CHANGED TO MATCH PSEUDOCODE ############
     parser.add_argument(
         "--causal_graph",
         type=str,
-        help="Path to GML file with causal graph (required for ATE mode)"
+        help="Path to GML file with causal graph (required for the DoWhy backend)"
     )
+    #################
     parser.add_argument(
         "--marginal_weight",
         type=float,
         help="Weight for L1 marginal error in hybrid selection (0.0 = pure ATE, 1.0 = pure marginal)."
              " Only used when selection_mode='ate'. Default: 0.3"
     )
+    ############ CHANGED TO MATCH PSEUDOCODE ############
     parser.add_argument(
         "--ate_method",
         type=str,
         choices=["dowhy", "fwl"],
         help="ATE estimation backend: 'dowhy' (CausalModel + backdoor) or 'fwl' "
-             "(claim_fwl_ate_estimator from fwl.py). 'fwl' requires per-config 'bounds'."
+             "(full-query FWL, the default). 'fwl' requires per-config 'bounds'."
     )
+    #################
 
     parser.set_defaults(**default_params())
     args = parser.parse_args()
@@ -1386,24 +2035,42 @@ if __name__ == "__main__":
     if args.ate_configs is not None:
         with open(args.ate_configs, 'r') as f:
             ate_configs_list = json.load(f)
+    ############ CHANGED TO MATCH PSEUDOCODE ############
+    if args.selection_mode is None:
+        args.selection_mode = "ate" if ate_configs_list else "marginal"
+    #################
 
-    data = Dataset.load(args.dataset, args.domain)
+    # The new mbi has no Dataset.load: read the CSV and the domain JSON directly.
+    _frame = pd.read_csv(args.dataset)
+    with open(args.domain) as _f:
+        _config = json.load(_f)
+    data = Dataset({a: _frame[a].to_numpy() for a in _config},
+                   Domain(list(_config), list(_config.values())))
 
-    workload = list(itertools.combinations(data.domain, args.degree))
-    workload = [cl for cl in workload if data.domain.size(cl) <= args.max_cells]
-    if args.num_marginals is not None:
-        prng = np.random
-        workload = [
-            workload[i]
-            for i in prng.choice(len(workload), args.num_marginals, replace=False)
-        ]
-
-    workload = [(cl, 1.0) for cl in workload]
+    ############ CHANGED TO MATCH PSEUDOCODE ############
+    if args.selection_mode == "ate" and args.ate_method == "fwl":
+    #################
+        # The FWL path builds every candidate up to max_candidate_arity.
+        ############ CHANGED TO MATCH PSEUDOCODE ############
+        workload = []
+    else:
+        workload = list(itertools.combinations(data.domain, args.degree))
+        workload = [cl for cl in workload if data.domain.size(cl) <= args.max_cells]
+        if args.num_marginals is not None:
+            prng = np.random
+            workload = [
+                workload[i]
+                for i in prng.choice(len(workload), args.num_marginals, replace=False)
+            ]
+        workload = [(cl, 1.0) for cl in workload]
+        #################
     
     adaptive_lambda = args.adaptive_lambda and not args.fixed_lambda_from_list
 
+    ############ CHANGED TO MATCH PSEUDOCODE ############
     claim_kwargs = dict(
         max_model_size=args.max_model_size,
+        max_candidate_arity=args.max_candidate_arity,
         max_iters=args.max_iters,
         selection_mode=args.selection_mode,
         ate_configs=ate_configs_list,
@@ -1420,14 +2087,21 @@ if __name__ == "__main__":
         reference_ates=None,
         ate_sensitivity=args.ate_sensitivity,
         reference_ate_rho_fraction=args.reference_ate_rho_fraction,
+        reference_ate_rho=args.reference_ate_rho,
+        sigma_n=args.sigma_n,
+        overlap_eta=args.overlap_eta,
+        n_min=args.n_min,
+        sim_sample_size=args.sim_sample_size,
         ate_outcome_range=(args.ate_outcome_min, args.ate_outcome_max),
     )
+    #################
 
     selected_lambda = None
     lambda_scores = None
     if args.fixed_lambda_from_list:
         lambda_values = [float(x.strip()) for x in args.lambda_values.split(',') if x.strip()]
-        selected_lambda, lambda_scores, model, synth = pilot_select_lambda(
+        ############ CHANGED TO MATCH PSEUDOCODE ############
+        selected_lambda, lambda_scores, model, synth, mech = pilot_select_lambda(
             data,
             workload,
             args.epsilon,
@@ -1435,19 +2109,26 @@ if __name__ == "__main__":
             lambda_values=lambda_values,
             pilot_fraction=args.pilot_fraction,
             pilot_samples=args.pilot_samples,
+            return_mechanism=True,
             **claim_kwargs,
         )
+        #################
     else:
         mech = CLAIM(args.epsilon, args.delta, **claim_kwargs)
         model, synth = mech.run(data, workload)
 
     if args.save is not None:
-        synth.df.to_csv(args.save, index=False)
+        _to_frame(synth).to_csv(args.save, index=False)
 
     # Print ATE comparison if in ATE mode
     if args.selection_mode == "ate":
-        true_ates = mech._true_ates
-        synth_ates = mech.compute_all_ates(synth.df)
+        ############ CHANGED TO MATCH PSEUDOCODE ############
+        if args.ate_method == "fwl":
+            true_ates = mech.compute_all_ates(_to_frame(data))
+        else:
+            true_ates = mech._true_ates
+        #################
+        synth_ates = mech.compute_all_ates(_to_frame(synth))
         print("\nATE Comparison:")
         total_weighted_error = 0.0
         for config in mech.ate_configs:
@@ -1468,7 +2149,16 @@ if __name__ == "__main__":
     # Print marginal errors
     synth_errors = []
     model_errors = []
-    for proj, wgt in workload:
+    ############ CHANGED TO MATCH PSEUDOCODE ############
+    if args.selection_mode == "ate" and args.ate_method == "fwl":
+        evaluation_workload = [
+            (cl, 1.0) for cl in itertools.combinations(data.domain, 2)
+        ]
+    else:
+        evaluation_workload = workload
+    # for proj, wgt in workload:
+    for proj, wgt in evaluation_workload:
+    #################
         X = data.project(proj).datavector()
         Y = synth.project(proj).datavector()
         Z = model.project(proj).datavector()
