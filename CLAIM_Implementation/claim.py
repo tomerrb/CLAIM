@@ -101,6 +101,10 @@ class CLAIM(Mechanism):
 
     LAMBDA_UPDATE_FACTOR = 1.25
     TOLERANCE_Z = 2.0
+    ############ CLEAR COMPILED CODE WITHIN A ROUND ############
+    # Model projections between two jax.clear_caches() calls (see _jax_cache_checkpoint).
+    JAX_CACHE_CLEAR_EVERY = 200
+    #################
 
     def __init__(
         self,
@@ -203,6 +207,9 @@ class CLAIM(Mechanism):
         self.n_min = int(n_min)
         self._fwl_tilde_n = None
         self._reference_release = {}
+        #################
+        ############ CLEAR COMPILED CODE WITHIN A ROUND ############
+        self._projections_since_clear = 0
         #################
         self.ate_outcome_range = (float(ate_outcome_range[0]), float(ate_outcome_range[1]))
         self.mu_eta = float(mu_eta)
@@ -901,6 +908,30 @@ class CLAIM(Mechanism):
         # Deterministic: pick max error
         return max(errors, key=errors.get)
 
+    ############ CLEAR COMPILED CODE WITHIN A ROUND ############
+    def _jax_cache_checkpoint(self, projections=1):
+        """Count model projections; clear JAX's compiled-code cache every
+        JAX_CACHE_CLEAR_EVERY of them.
+
+        THIS DOES NOT CHANGE THE RESULTS. jax.clear_caches() only discards
+        compiled programs; the next call recompiles the same program and
+        computes the same values. No model, measurement, privacy budget or
+        random state is read or changed, so every selection, noise draw and
+        synthetic record is identical with or without it; only runtime grows
+        (recompilation).
+
+        Why: each compiled projection adds memory mappings to the process.
+        The once-per-round clear in _run_fwl is too late for large candidate
+        pools: a single round over Census-KDD's 876 candidates reached the
+        Linux limit (vm.max_map_count = 65,530) and crashed with "LLVM
+        compilation error: Cannot allocate memory".
+        """
+        self._projections_since_clear += projections
+        if self._projections_since_clear >= self.JAX_CACHE_CLEAR_EVERY:
+            jax.clear_caches()
+            self._projections_since_clear = 0
+    #################
+
     def _compute_stat_term(self, candidates, answers, model, sigma):
         """Statistical term L_r(D) for the FWL/ATE path.
 
@@ -928,6 +959,9 @@ class CLAIM(Mechanism):
         for cl in candidates:
             x = answers[cl]
             xest = model.project(cl).datavector()
+            ############ CLEAR COMPILED CODE WITHIN A ROUND ############
+            self._jax_cache_checkpoint()  # does not change results (see its docstring)
+            #################
             n_r = model.domain.size(cl)
             ############ CHANGED TO MATCH PSEUDOCODE ############
             N = self._fwl_tilde_n if self.ate_method == "fwl" else x.sum()
@@ -1047,6 +1081,9 @@ class CLAIM(Mechanism):
         for cl in eligible:
             curr = model.project(cl).datavector()
             prev = prev_model.project(cl).datavector()
+            ############ CLEAR COMPILED CODE WITHIN A ROUND ############
+            self._jax_cache_checkpoint(2)  # does not change results (see its docstring)
+            #################
             discrepancy = np.linalg.norm(curr / curr.sum() - prev / prev.sum(), 1)
             bias = np.sqrt(2 / np.pi) * sigma * model.domain.size(cl) / self._fwl_tilde_n
             l_values.append(abs(discrepancy - bias))
