@@ -640,7 +640,7 @@ class CLAIM(Mechanism):
         return theta_a, theta_l
 
     def _adjust_lambda(self, current_lambda, tvd_error, ate_error, tvd_tolerance, ate_tolerance):
-        """Dual-criterion lambda update from Maria Vologdin (de3bee5).
+        """Dual-criterion lambda update.
 
         Lambda (marginal_weight) decreases toward the causal term only when TVD
         is already within tolerance — ensuring TVD preservation cannot be
